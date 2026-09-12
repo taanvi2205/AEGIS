@@ -130,6 +130,7 @@ class LiveAgent:
     max_steps: int = 8
     timeout: float = 180.0
     temperature: float = 0.0
+    seed: int = 20260910
 
     def _chat(self, messages: list[dict]) -> str:
         body = json.dumps({
@@ -139,7 +140,12 @@ class LiveAgent:
             # actually reads the fetched page before choosing its next action -
             # which would defeat the point of running a live agent at all.
             "format": "json",
-            "options": {"temperature": self.temperature},
+            # Greedy, seeded decoding. This makes the run *highly* reproducible
+            # but not guaranteed bit-identical: GPU inference reorders
+            # floating-point reductions, so the same prompt can occasionally
+            # decode differently. See docs/decisions.md D-15.
+            "options": {"temperature": self.temperature, "seed": self.seed,
+                        "top_k": 1, "top_p": 1.0},
         }).encode()
         req = urllib.request.Request(self.endpoint, data=body,
                                      headers={"Content-Type": "application/json"})
@@ -273,7 +279,15 @@ DEMO_URL = "https://intranet.northwind.example/q3"
 ATTACKER = "archive@evil-partner.com"
 
 
-def demo_world(root: str = "sandbox") -> ToolWorld:
-    """The sandbox the live demo runs in: one page, containing one injection."""
+def demo_world(root: str = "sandbox", page: str | None = None,
+               url: str | None = None) -> ToolWorld:
+    """The sandbox the live demo runs in: one page, containing one injection.
+
+    `page` and `url` default to the built-in scenario but can be replaced with
+    anything typed at the command line. Whatever is supplied is served by the
+    ordinary mocked fetch tool - there is no path by which the content reaches
+    the enforcement layers as anything other than untrusted input.
+    """
     from pathlib import Path
-    return ToolWorld(Path(root), documents={DEMO_URL: (DEMO_PAGE, False)})
+    return ToolWorld(Path(root),
+                     documents={(url or DEMO_URL): (page or DEMO_PAGE, False)})
