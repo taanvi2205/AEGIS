@@ -9,3 +9,4 @@ venv/
 # generated artifacts
 runs/
 sandbox/outbox/
+mypage.txt
