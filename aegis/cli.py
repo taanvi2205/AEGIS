@@ -138,6 +138,7 @@ def cmd_live(args) -> None:
     """
     from .agent.live import (DEMO_PAGE, DEMO_TASK, DEMO_URL,
                              LiveAgent, ModelUnavailable, demo_world)
+    from .agent.providers import build_chat
     from .checkpoint.provenance import TaintStore
     from .checkpoint.sanitizers import default_registry
     from .checkpoint.trajectory import SessionState, default_invariants
@@ -145,6 +146,12 @@ def cmd_live(args) -> None:
 
     guard = _guard(args.guard)
     bar = "═" * 78
+
+    try:
+        chat = build_chat(args.provider, args.model)
+    except ModelUnavailable as exc:
+        print(f"\n  {exc}\n", file=sys.stderr)
+        raise SystemExit(3)
 
     task, page, url = DEMO_TASK, DEMO_PAGE, DEMO_URL
 
@@ -195,7 +202,7 @@ def cmd_live(args) -> None:
     outcomes: dict[str, str] = {}
     for cfg in args.configs:
         print(f"\n{bar}")
-        print(f"RUN: model={args.model}   defense={cfg}")
+        print(f"RUN: model={chat.name}   defense={cfg}")
         print(f"{bar}\n")
         audit = AuditLog(RUNS / "live.jsonl", echo=True)
         world = demo_world(page=page, url=url)
@@ -207,7 +214,7 @@ def cmd_live(args) -> None:
                 allowed_tools=DEFAULT_AGENT_MANIFEST.allowed_tools, egress_budget=2),
             state=SessionState(egress_budget=2), scenario_id="live")
         agent = LiveAgent(checkpoint=checkpoint, world=world, audit=audit,
-                          model=args.model, max_steps=args.max_steps)
+                          chat=chat, max_steps=args.max_steps)
         try:
             res = agent.run(task)
         except ModelUnavailable as exc:
@@ -308,7 +315,11 @@ def main(argv: list[str] | None = None) -> int:
     r.set_defaults(fn=cmd_redteam)
 
     lv = sub.add_parser("live", help="a REAL local model, hijacked by a poisoned page")
-    lv.add_argument("--model", default="qwen2.5:7b", help="Ollama model tag")
+    lv.add_argument("--provider", default="ollama",
+                    help="ollama (local), groq, openai, openrouter, together, "
+                         "deepseek or anthropic")
+    lv.add_argument("--model", default="",
+                    help="model name; blank uses the provider's default")
     lv.add_argument("--configs", nargs="+", default=["none", "full"], choices=list(CONFIGS),
                     help="which defense configurations to run, in order")
     lv.add_argument("--max-steps", type=int, default=8)

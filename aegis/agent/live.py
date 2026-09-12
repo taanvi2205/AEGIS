@@ -32,13 +32,13 @@ from ..checkpoint.checkpoint import Checkpoint
 from ..core import Content, Label, ToolCall, Verdict
 from ..tools.manifests import TOOL_MANIFESTS
 from ..tools.mock import ToolWorld
+from .providers import ChatBackend, ModelUnavailable, build_chat
 
 DEFAULT_MODEL = os.environ.get("AEGIS_OLLAMA_MODEL", "qwen2.5:7b")
 DEFAULT_URL = os.environ.get("AEGIS_OLLAMA_URL", "http://localhost:11434/api/chat")
 
-
-class ModelUnavailable(RuntimeError):
-    """Raised when the local model cannot be reached or returns nothing usable."""
+__all__ = ["LiveAgent", "LiveResult", "ModelUnavailable", "extract_json",
+           "demo_world", "DEMO_TASK", "DEMO_PAGE", "DEMO_URL", "ATTACKER"]
 
 
 def extract_json(raw: str) -> dict[str, Any] | None:
@@ -125,38 +125,16 @@ class LiveAgent:
     checkpoint: Checkpoint
     world: ToolWorld
     audit: AuditLog
-    model: str = DEFAULT_MODEL
-    endpoint: str = DEFAULT_URL
+    chat: ChatBackend = field(default_factory=lambda: build_chat("ollama"))
     max_steps: int = 8
-    timeout: float = 180.0
-    temperature: float = 0.0
-    seed: int = 20260910
+
+    @property
+    def model(self) -> str:
+        """The backend's display name, used in logs and demo headers."""
+        return self.chat.name
 
     def _chat(self, messages: list[dict]) -> str:
-        body = json.dumps({
-            "model": self.model, "stream": False, "messages": messages,
-            # `format: json` constrains decoding to a single valid JSON value.
-            # Without it a 7B model emits its whole plan at once and never
-            # actually reads the fetched page before choosing its next action -
-            # which would defeat the point of running a live agent at all.
-            "format": "json",
-            # Greedy, seeded decoding. This makes the run *highly* reproducible
-            # but not guaranteed bit-identical: GPU inference reorders
-            # floating-point reductions, so the same prompt can occasionally
-            # decode differently. See docs/decisions.md D-15.
-            "options": {"temperature": self.temperature, "seed": self.seed,
-                        "top_k": 1, "top_p": 1.0},
-        }).encode()
-        req = urllib.request.Request(self.endpoint, data=body,
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:   # noqa: S310
-                payload = json.loads(resp.read().decode())
-        except urllib.error.URLError as exc:
-            raise ModelUnavailable(
-                f"cannot reach Ollama at {self.endpoint}: {exc}. "
-                f"Start it with `ollama serve` and pull a model.") from exc
-        return payload.get("message", {}).get("content", "")
+        return self.chat.complete(messages)
 
     def run(self, task: str) -> LiveResult:
         """Run the agent until it declares done or hits the step limit."""
