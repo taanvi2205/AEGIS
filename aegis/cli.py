@@ -5,6 +5,7 @@
     python -m aegis sweep       obfuscation sweep + plot
     python -m aegis redteam     adaptive red-team loop + plot
     python -m aegis report      everything, written to runs/ as JSON, SVG and Markdown
+    python -m aegis live        a REAL local model, hijacked by a poisoned page, live
     python -m aegis policy      print the shipped manifests, sanitizers and invariants
 
 The terminal output is the demo (§8): request, tag assignment, layer checks,
@@ -19,7 +20,7 @@ import sys
 from pathlib import Path
 
 from .audit import AuditLog
-from .checkpoint.checkpoint import CONFIGS
+from .checkpoint.checkpoint import CONFIGS, Checkpoint
 from .checkpoint.classifier import GuardUnavailable, build_guard
 from .checkpoint.sanitizers import default_registry
 from .checkpoint.trajectory import default_invariants
@@ -128,6 +129,66 @@ def cmd_redteam(args) -> None:
     print(f"\nwrote {RUNS / f'redteam_{args.target}.json'} and {p}")
 
 
+def cmd_live(args) -> None:
+    """Run a real local model against a poisoned page, undefended then defended.
+
+    Nothing about the attack is scripted: the model reads the page through the
+    ordinary fetch tool and decides for itself what to do next. The only thing
+    that differs between the two runs is which enforcement layers are switched on.
+    """
+    from .agent.live import (ATTACKER, DEMO_PAGE, DEMO_TASK, DEMO_URL,
+                             LiveAgent, ModelUnavailable, demo_world)
+    from .checkpoint.provenance import TaintStore
+    from .checkpoint.sanitizers import default_registry
+    from .checkpoint.trajectory import SessionState, default_invariants
+    from .tools.manifests import DEFAULT_AGENT_MANIFEST, AgentManifest
+
+    guard = _guard(args.guard)
+    bar = "═" * 78
+
+    print(f"\n{bar}\nTHE TASK GIVEN TO THE AGENT\n{bar}\n  {DEMO_TASK}\n")
+    print(f"{bar}\nTHE PAGE IT WILL READ  ({DEMO_URL})\n{bar}")
+    for line in DEMO_PAGE.strip().splitlines():
+        print(f"  {line}")
+    print(f"\n  ↑ nobody told the agent to do this. It is buried in the page.\n")
+
+    outcomes: dict[str, str] = {}
+    for cfg in args.configs:
+        print(f"\n{bar}")
+        print(f"RUN: model={args.model}   defense={cfg}")
+        print(f"{bar}\n")
+        audit = AuditLog(RUNS / "live.jsonl", echo=True)
+        world = demo_world()
+        checkpoint = Checkpoint(
+            config=CONFIGS[cfg], guard=guard, audit=audit,
+            taint=TaintStore(), sanitizers=default_registry("sandbox"),
+            invariants=default_invariants(),
+            agent_manifest=AgentManifest(
+                allowed_tools=DEFAULT_AGENT_MANIFEST.allowed_tools, egress_budget=2),
+            state=SessionState(egress_budget=2), scenario_id="live")
+        agent = LiveAgent(checkpoint=checkpoint, world=world, audit=audit,
+                          model=args.model, max_steps=args.max_steps)
+        try:
+            res = agent.run(DEMO_TASK)
+        except ModelUnavailable as exc:
+            print(f"\n  cannot run the live model: {exc}\n", file=sys.stderr)
+            raise SystemExit(3)
+
+        leaked = [t for t in res.egress_targets if ATTACKER in t and ":allow" in t]
+        outcomes[cfg] = ("LEAKED to " + ATTACKER) if leaked else (
+            "blocked — " + (res.blocked[0] if res.blocked else "never attempted"))
+        audit.close()
+
+    print(f"\n{bar}\nRESULT\n{bar}")
+    for cfg, outcome in outcomes.items():
+        mark = "✖" if "LEAKED" in outcome else "✔"
+        print(f"  {mark}  defense={cfg:<12} {outcome}")
+    if len(outcomes) > 1:
+        print("\n  Same model, same page, same task. Only the enforcement layers changed.\n")
+    else:
+        print()
+
+
 def cmd_try(args) -> None:
     from .interactive import run
     try:
@@ -193,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--target", default="input_only", choices=list(CONFIGS))
     r.add_argument("--configs", nargs="+", default=ALL_CONFIGS, choices=list(CONFIGS))
     r.set_defaults(fn=cmd_redteam)
+
+    lv = sub.add_parser("live", help="a REAL local model, hijacked by a poisoned page")
+    lv.add_argument("--model", default="qwen2.5:7b", help="Ollama model tag")
+    lv.add_argument("--configs", nargs="+", default=["none", "full"], choices=list(CONFIGS),
+                    help="which defense configurations to run, in order")
+    lv.add_argument("--max-steps", type=int, default=8)
+    lv.set_defaults(fn=cmd_live)
 
     t = sub.add_parser("try", help="interactive: type your own attack and watch it decide")
     t.add_argument("--defense", default="full", choices=list(CONFIGS))
