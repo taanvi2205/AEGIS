@@ -32,6 +32,12 @@ class ModelUnavailable(RuntimeError):
     """Raised when a model cannot be reached or returns nothing usable."""
 
 
+# Hosted providers sit behind bot protection that rejects the default
+# `Python-urllib/x.y` user agent with an HTTP 403 (Cloudflare error 1010).
+# Every real API client sends its own identifier; this is ours.
+USER_AGENT = "aegis-harness/1.0 (+https://github.com/taanvi2205/AEGIS)"
+
+
 def _post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
     """POST JSON and return the parsed response.
 
@@ -40,13 +46,27 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
     """
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", **headers})
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json",
+                 "User-Agent": USER_AGENT, **headers})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:   # noqa: S310
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")[:400]
-        raise ModelUnavailable(f"{exc.code} from {url.split('?')[0]}: {body}") from exc
+        hint = ""
+        if exc.code == 401:
+            hint = "\n  → the API key is missing, wrong, or revoked."
+        elif exc.code == 403:
+            hint = ("\n  → forbidden. If the body mentions error 1010 this is a bot "
+                    "check on the user agent; if it mentions the key, the key lacks "
+                    "access to this model.")
+        elif exc.code == 404:
+            hint = "\n  → that model name does not exist for this provider."
+        elif exc.code == 429:
+            hint = "\n  → rate limited; wait a moment or use a smaller model."
+        raise ModelUnavailable(
+            f"{exc.code} from {url.split('?')[0]}: {body}{hint}") from exc
     except urllib.error.URLError as exc:
         raise ModelUnavailable(f"cannot reach {url.split('?')[0]}: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
@@ -91,7 +111,10 @@ class OllamaChat(ChatBackend):
 # base URL and a default model, not new code.
 OPENAI_COMPATIBLE: dict[str, tuple[str, str, str]] = {
     # name: (base url, default model, api key env var)
-    "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", "GROQ_API_KEY"),
+    # qwen3.8-27b returns plain content. Groq's gpt-oss-* models are reasoning
+    # models that put their answer in a separate channel and return an empty
+    # `content`, so they do not drive this agent loop without extra handling.
+    "groq": ("https://api.groq.com/openai/v1", "qwen/qwen3.8-27b", "GROQ_API_KEY"),
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini", "OPENAI_API_KEY"),
     "openrouter": ("https://openrouter.ai/api/v1", "meta-llama/llama-3.3-70b-instruct",
                    "OPENROUTER_API_KEY"),
@@ -148,7 +171,13 @@ class OpenAICompatChat(ChatBackend):
         choices = data.get("choices") or []
         if not choices:
             raise ModelUnavailable(f"{self.name} returned no choices")
-        return choices[0].get("message", {}).get("content", "")
+        content = choices[0].get("message", {}).get("content", "")
+        if not content.strip():
+            raise ModelUnavailable(
+                f"{self.name} returned empty content. Reasoning models often put "
+                f"their answer in a separate field; pick a non-reasoning model, "
+                f"e.g. --model qwen/qwen3.8-27b")
+        return content
 
 
 @dataclass
